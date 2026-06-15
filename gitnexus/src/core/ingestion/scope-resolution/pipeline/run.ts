@@ -37,9 +37,12 @@ import { buildGraphNodeLookup } from '../graph-bridge/node-lookup.js';
 import {
   emitFileCfgs,
   emitFileReachingDefs,
+  emitFileCdg,
   isEmitSafeCfg,
   DEFAULT_MAX_CFG_EDGES_PER_FUNCTION,
   DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION,
+  DEFAULT_PDG_MAX_REACHING_DEF_FACTS_PER_FUNCTION,
+  DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION,
   REACHING_DEF_FACTS_PER_EDGE_CAP,
 } from '../../cfg/emit.js';
 import {
@@ -50,6 +53,12 @@ import {
 } from '../../taint/emit.js';
 import { registerBuiltinTaintModels } from '../../taint/typescript-model.js';
 import { getSourceSinkConfig } from '../../taint/source-sink-registry.js';
+import {
+  buildFunctionNodeIndex,
+  harvestFileSummaries,
+  type FunctionNodeIndex,
+} from '../../taint/summary-harvest-driver.js';
+import type { FunctionSummary } from '../../taint/summary-model.js';
 import type { FunctionCfg } from '../../cfg/types.js';
 import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import { buildPopulatedMethodDispatch } from '../graph-bridge/method-dispatch.js';
@@ -282,6 +291,9 @@ interface RunScopeResolutionInput {
   /** Per-function REACHING_DEF edge cap (#2082 M2). `undefined` ⇒
    *  {@link DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION}; `0` ⇒ no cap. */
   readonly pdgMaxReachingDefEdgesPerFunction?: number;
+  /** Per-function CDG (control-dependence) edge cap (#2085 M5). `undefined` ⇒
+   *  {@link DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION}; `0` ⇒ no cap. */
+  readonly pdgMaxCdgEdgesPerFunction?: number;
   /** Per-function taint findings cap (#2083 M3, consumed by the U4 taint
    *  emit step in the pdg window). `undefined` ⇒
    *  `DEFAULT_PDG_MAX_TAINT_FINDINGS_PER_FUNCTION` (200); `0` ⇒ no cap. */
@@ -302,6 +314,14 @@ interface RunScopeResolutionInput {
    * base is safe.
    */
   readonly prebuiltNodeLookup?: ReturnType<typeof buildGraphNodeLookup>;
+  /**
+   * Functionish-node index built ONCE by the caller and shared across every
+   * language pass (#2084 review P2-6). Like `prebuiltNodeLookup`,
+   * `buildFunctionNodeIndex` is a whole-graph scan and is language-agnostic, so
+   * rebuilding it per language wastes a full scan each time. When omitted
+   * (tests / isolated calls) it is built locally for the pdg-enabled language.
+   */
+  readonly prebuiltFunctionNodeIndex?: FunctionNodeIndex;
   /**
    * Opaque per-language import-resolution config (e.g. tsconfig path
    * aliases for TypeScript). Loaded once by the caller via
@@ -360,6 +380,13 @@ interface RunScopeResolutionStats {
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
   readonly resolutionOutcomes: readonly ResolutionOutcome[];
+  /**
+   * Per-function taint summaries harvested in the pdg window (#2084 M4 U1).
+   * Empty unless `input.pdg === true` and the language has a registered taint
+   * model. Keyed by resolved `Function`/`Method` node id; the cross-function
+   * fixpoint phase composes them over the complete `CALLS` graph.
+   */
+  readonly functionSummaries: readonly FunctionSummary[];
 }
 
 export function runScopeResolution(
@@ -477,6 +504,7 @@ export function runScopeResolution(
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
       resolutionOutcomes,
+      functionSummaries: [],
     };
   }
 
@@ -730,6 +758,11 @@ export function runScopeResolution(
   // pair can't bracket them; without this accumulator the M2 cost would
   // silently disappear into `emit=` and field regressions would be invisible.
   let pdgMs = 0;
+  // M4 (#2084 U1): per-function taint summaries harvested in the pdg window,
+  // returned on the stats for the cross-function fixpoint phase. Function-scoped
+  // so the return (below the pdg block) can read it; empty on non-pdg runs.
+  const harvestedSummaries: FunctionSummary[] = [];
+  let summaryUnresolved = 0;
   // M3 (#2083 U4): accumulated taint time (match + taint-side solve +
   // propagate + TAINTED/SANITIZES emit), a sibling of `pdgMs` for the same
   // reason — it interleaves per file inside `emit=`, so only an accumulator
@@ -743,6 +776,8 @@ export function runScopeResolution(
     let rdDropped = 0;
     let rdFacts = 0;
     let rdTruncated = 0;
+    let cdgEdges = 0;
+    let cdgDropped = 0;
     // ── M3 taint setup (#2083 U4) ────────────────────────────────────────
     // Explicit model-registration seam (idempotent, cheap) — the registry
     // stays empty on non-pdg runs, preserving default-run parity. The
@@ -784,6 +819,14 @@ export function runScopeResolution(
       gapExamples: [] as string[],
       dropExamples: [] as string[],
     };
+    // M4 (#2084 U1): per-function summary harvest. The functionish-node index
+    // is built ONCE (whole-graph scan) and reused across every file; summaries
+    // accumulate here and ride out on the stats for the cross-function fixpoint
+    // phase. Only built when the language has a registered taint model.
+    const fnNodeIndex =
+      taintSpec !== undefined
+        ? (input.prebuiltFunctionNodeIndex ?? buildFunctionNodeIndex(graph))
+        : undefined;
     for (const pf of emitParsedFiles) {
       const cfgs = pf.cfgSideChannel;
       // Defensive: cfgSideChannel is opaque (`unknown`) and crosses the cache /
@@ -841,6 +884,22 @@ export function runScopeResolution(
         rdFacts += rd.facts;
         rdTruncated += rd.truncatedFunctions;
 
+        // M5 (#2085 U5): control dependence over the SAME validated CFGs.
+        // Independent of taint — runs for every `--pdg` language (post-dom +
+        // Ferrante are language-agnostic, no source/sink model needed). Pure
+        // compute; the bounded (controller, dependent, label) projection is
+        // persisted and its time folds into the `pdg=` PROF segment next to RD.
+        const tCdg = PROF ? performance.now() : 0;
+        const cdg = emitFileCdg(
+          graph,
+          wellFormed,
+          input.pdgMaxCdgEdgesPerFunction ?? DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION,
+          (message) => logger.warn(message), // unconditional — R6, no silent truncation
+        );
+        if (PROF) pdgMs += performance.now() - tCdg;
+        cdgEdges += cdg.edges;
+        cdgDropped += cdg.droppedEdges;
+
         // M3 (#2083 U4): taint over the SAME validated CFGs, inside the SAME
         // per-file try (a taint throw costs this file's taint layer only —
         // its CFG/REACHING_DEF edges above are already in the graph). Skipped
@@ -872,6 +931,25 @@ export function runScopeResolution(
           for (const ex of taint.droppedExamples) {
             if (taintTotals.dropExamples.length < 5) taintTotals.dropExamples.push(ex);
           }
+
+          // M4 (#2084 U1): harvest per-function summaries over the SAME
+          // emit-safe CFGs, inside the SAME per-file try. Pure aside from the
+          // read-only node-index lookup; the cross-function fixpoint phase
+          // consumes `harvestedSummaries` once the whole call graph is built.
+          if (fnNodeIndex !== undefined) {
+            const harvest = harvestFileSummaries(
+              fnNodeIndex,
+              wellFormed,
+              pf.parsedImports,
+              taintSpec,
+              // Same fact cap the taint-side RD solve uses (coverage parity).
+              taintLimits.maxFacts && taintLimits.maxFacts > 0
+                ? taintLimits.maxFacts
+                : DEFAULT_PDG_MAX_REACHING_DEF_FACTS_PER_FUNCTION,
+            );
+            harvestedSummaries.push(...harvest.summaries);
+            summaryUnresolved += harvest.unresolved;
+          }
         }
       } catch (err) {
         // Last-resort isolation, mirroring the worker-side per-file try/catch:
@@ -895,6 +973,8 @@ export function runScopeResolution(
           `; ${rdEdges} REACHING_DEF edges (${rdFacts} facts)` +
           (rdDropped > 0 ? `, ${rdDropped} REACHING_DEF edges dropped (per-function cap)` : '') +
           (rdTruncated > 0 ? `, ${rdTruncated} function(s) hit the fact limit` : '') +
+          `; ${cdgEdges} CDG edges` +
+          (cdgDropped > 0 ? `, ${cdgDropped} CDG edges dropped (per-function cap)` : '') +
           // M3 volume telemetry — only for languages with a registered model.
           (taintSpec !== undefined
             ? `; taint: ${taintTotals.findings} TAINTED, ${taintTotals.kills} SANITIZES ` +
@@ -942,6 +1022,16 @@ export function runScopeResolution(
         logger.warn(`[taint] lang=${provider.language}: ${parts.join('; ')}`);
       }
     }
+    // M4 (#2084 U1): summary harvest volume + anchor-resolution diagnostics.
+    if (harvestedSummaries.length > 0 || summaryUnresolved > 0) {
+      logger.debug(
+        `[taint-summary] lang=${provider.language}: ${harvestedSummaries.length} function ` +
+          `summary/summaries harvested` +
+          (summaryUnresolved > 0
+            ? `, ${summaryUnresolved} CFG anchor(s) unresolved (same-line collision or missing node)`
+            : ''),
+      );
+    }
   }
 
   if (PROF) {
@@ -971,5 +1061,6 @@ export function runScopeResolution(
     referenceEdgesEmitted: emitted + receiverExtras + unresolvedReceiverExtras + freeCallExtras,
     referenceSkipped: skipped,
     resolutionOutcomes,
+    functionSummaries: harvestedSummaries,
   };
 }

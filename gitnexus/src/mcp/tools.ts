@@ -72,6 +72,11 @@ export const LIST_REPOS_MAX_LIMIT = 200;
 export const EXPLAIN_DEFAULT_LIMIT = 50;
 export const EXPLAIN_MAX_LIMIT = 200;
 
+// pdg_query result-page bounds (#2086 M6). Mirror the EXPLAIN_* limits — the
+// no-rel-index path means every page must be anchored + LIMIT-bounded.
+export const PDG_QUERY_DEFAULT_LIMIT = 50;
+export const PDG_QUERY_MAX_LIMIT = 200;
+
 export const GITNEXUS_TOOLS: ToolDefinition[] = [
   {
     name: 'list_repos',
@@ -130,7 +135,14 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Natural language or keyword search query' },
+        // #2175: the legacy `query` key is still accepted by the handler
+        // (resolveAliasString in local-backend.ts), but is deliberately NOT named in the
+        // advertised property or its description — surfacing "query" in the schema an LLM
+        // reads would nudge it to send `query`, the exact argument Claude Code drops.
+        search_query: {
+          type: 'string',
+          description: 'Natural language or keyword search query.',
+        },
         task_context: {
           type: 'string',
           description: 'What you are working on (e.g., "adding OAuth support"). Helps ranking.',
@@ -171,7 +183,7 @@ SERVICE: optional monorepo path prefix (POSIX-style, case-sensitive segments). W
             'Optional monorepo service root (relative path, "/" separators). In group mode (@repo), prefix-matches symbol file paths; ignored for a normal repo name. Empty string is rejected server-side.',
         },
       },
-      required: ['query'],
+      required: ['search_query'],
     },
   },
   {
@@ -219,12 +231,20 @@ TIPS:
 - All relationships use single CodeRelation table — filter with {type: 'CALLS'} etc.
 - Community = auto-detected functional area (Leiden algorithm). Properties: heuristicLabel, cohesion, symbolCount, keywords, description, enrichedBy
 - Process = execution flow trace from entry point to terminal. Properties: heuristicLabel, processType, stepCount, communities, entryPointId, terminalId
-- Use heuristicLabel (not label) for human-readable community/process names`,
+- Use heuristicLabel (not label) for human-readable community/process names
+- PDG layers (only when indexed with \`--pdg\`): BasicBlock nodes + CFG / CDG (control dependence, branch sense 'T'|'F' in reason) / REACHING_DEF (def→use, variable in reason) edges, all BasicBlock→BasicBlock. Prefer the \`pdg_query\` tool — it anchors + bounds these for you (raw \`[:CDG*]\`/\`[:REACHING_DEF*]\` path scans are unindexed and unbounded).`,
     annotations: READ_ONLY_TOOL_ANNOTATIONS,
     inputSchema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Cypher query to execute' },
+        // #2175: the legacy `query` key is still accepted by the handler
+        // (resolveAliasString in local-backend.ts), but is deliberately NOT named in the
+        // advertised property or its description — surfacing "query" in the schema an LLM
+        // reads would nudge it to send `query`, the exact argument Claude Code drops.
+        statement: {
+          type: 'string',
+          description: 'Cypher statement to execute.',
+        },
         params: {
           type: 'object',
           description:
@@ -235,7 +255,7 @@ TIPS:
           description: 'Repository name or path. Omit if only one repo is indexed.',
         },
       },
-      required: ['query'],
+      required: ['statement'],
     },
   },
   {
@@ -525,18 +545,19 @@ SERVICE: optional monorepo path prefix (case-sensitive path segments). When "rep
   },
   {
     name: 'explain',
-    description: `Explain persisted taint findings: intra-procedural source→sink data flows (TAINTED edges) recorded by \`gitnexus analyze --pdg\`.
+    description: `Explain persisted taint findings recorded by \`gitnexus analyze --pdg\`: intra-procedural source→sink data flows (TAINTED edges, statement-level hops) AND cross-function flows (TAINT_PATH edges, function-level hops, marked \`interprocedural: true\`).
 
-Each finding carries the sink category (command-injection, code-injection, path-traversal, sql-injection, xss), the source/sink lines, and the ordered hop path with the variable carried on each hop (decoded from the persisted path encoding).
+Each finding carries the sink category (command-injection, code-injection, path-traversal, sql-injection, xss) and the ordered hop path. Intra-procedural findings carry source/sink lines and the variable on each hop; interprocedural findings carry the source and sink FUNCTION names and the chain of functions the taint crossed (decoded from the persisted path encoding).
 
 WHEN TO USE: Security review — "what taint findings exist in this repo / file / function?". Requires the repo to be indexed with \`gitnexus analyze --pdg\`; without that layer the tool returns a clear "no taint layer" note, not an error.
 
 ANCHORLESS (no "target"): enumerates all persisted findings for the repo — bounded ("limit", deterministic order), with "totalFindings" and a "truncated" flag.
-ANCHORED ("target" = file path or symbol/function name): full hop detail for that anchor. A file-ish target (contains "/" or an extension) filters by file; a symbol name resolves like context() — ambiguous names return ranked candidates, unknown names return not-found. Symbol anchoring is line-range granular (findings whose source block starts inside the symbol's span).
+ANCHORED ("target" = file path or symbol/function name): full hop detail for that anchor. A file-ish target (contains "/" or an extension) filters by file; a symbol name resolves like context() — ambiguous names return ranked candidates, unknown names return not-found. Symbol anchoring is line-range granular for intra-procedural findings; cross-function findings match when the symbol is the source OR sink function.
 
-CONTRACT CAVEATS (intra-procedural M3 scope — absent flows are NOT proof of safety):
-- Cross-function flows are not modeled (a flow through a helper function is invisible).
-- Closure/callback flows are invisible in both directions (e.g. arr.forEach(() => sink(y))).
+CONTRACT CAVEATS (absent flows are NOT proof of safety):
+- Cross-function flows ARE modeled (#2084 M4): a source flowing through helper functions into a sink is found, via summary composition over the call graph (context-insensitive — return/call-site merging is accepted).
+- Cross-function matching is by callee NAME (context-insensitive): when one caller invokes two distinct same-named callees, a flow into one over-attributes to both — a cross-function finding does not prove the taint reached every same-named function (sound over-report, never a missed flow).
+- Closure/callback flows are invisible in both directions (e.g. arr.forEach(() => sink(y))) — the largest false-negative class.
 - Property/field flows are not tracked (obj.x = taint; sink(obj.y) has no chain).
 - Guard-style sanitizers (if (isValid(x))) and implicit/control-dependence flows are not modeled.
 - CommonJS aliasing is partially modeled (require('<literal>') joins resolve; dynamic requires do not).
@@ -565,6 +586,58 @@ Findings are deliberately NOT part of impact()'s traversal or the web schema —
         },
       },
       required: [],
+    },
+  },
+  {
+    name: 'pdg_query',
+    description: `Query the persisted Program Dependence Graph recorded by \`gitnexus analyze --pdg\` — control dependence (CDG) and data dependence (REACHING_DEF) at basic-block granularity. The control/data analog of \`explain\` (which is the taint consumer).
+
+MODES:
+- \`controls\` — "under what condition does X run?". Returns, for the anchored function, each control-dependence edge: the controlling predicate block, the dependent block, and the branch sense ('T' = the predicate's true/taken arm, 'F' = its false/fall-through arm). An edge into an early return/throw block is flagged \`guard: true\` (subsumes the #559 guard heuristic); the branch sense of a guard depends on its predicate — \`if (!ok) return;\` rides the 'T' arm — so don't filter guards by a fixed label.
+- \`flows\` — "where does variable Y flow?". Returns REACHING_DEF def→use edges for the anchored function; pass \`variable\` to filter to one binding.
+
+WHEN TO USE: comprehension ("what guards this statement?"), data-flow tracing within a function, guard-clause discovery. Requires \`gitnexus analyze --pdg\`; without that layer the tool returns a clear "no PDG layer" note, not an error.
+
+ANCHORING (required): \`target\` is a file path or a symbol/function name (resolved like context()). PDG queries are ALWAYS anchored — there is no whole-repo enumeration (an unanchored basic-block path scan is unbounded; LadybugDB has no rel-property index). A symbol target is line-range granular; an ambiguous name returns ranked candidates, unknown returns not-found.
+
+CONTRACT CAVEATS:
+- CDG labels are binary 'T'/'F' in M5/M6; per-case \`switch\` arm conditions are not yet distinguished (every case dispatch is 'T').
+- Granularity is basic-block, reconstructed to the function via the BasicBlock id + line span (no Function→BasicBlock edge); deeply same-line-packed functions may anchor coarsely.
+- Control/data dependence is intra-procedural (per function). Cross-function flow is taint's domain (\`explain\`).
+- These edges are deliberately NOT part of impact()'s traversal — \`pdg_query\` is the dedicated consumer; raw edges are also queryable via \`cypher\`.`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['controls', 'flows'],
+          description:
+            "'controls' = control dependence (CDG: what condition gates X); 'flows' = data dependence (REACHING_DEF: where variable Y flows).",
+        },
+        target: {
+          type: 'string',
+          description:
+            'Required anchor: a file path (e.g. "src/handlers/run.ts" — suffix match accepted) or a symbol/function name (resolved like context()).',
+        },
+        variable: {
+          type: 'string',
+          description:
+            'Optional (flows mode only): restrict REACHING_DEF results to this source-level variable name.',
+        },
+        limit: {
+          type: 'integer',
+          description: `Max edges returned (default: ${PDG_QUERY_DEFAULT_LIMIT}, max: ${PDG_QUERY_MAX_LIMIT}). "total" reports the full matched count; "truncated" is set when the page is smaller.`,
+          default: PDG_QUERY_DEFAULT_LIMIT,
+          minimum: 1,
+          maximum: PDG_QUERY_MAX_LIMIT,
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: ['mode', 'target'],
     },
   },
   {
@@ -687,6 +760,45 @@ WHEN TO USE: After changing group.yaml or re-indexing member repos.`,
       required: ['name'],
     },
   },
+  {
+    name: 'trace',
+    description: `Find the shortest directed path between two symbols over call and class-member edges.
+
+WHEN TO USE: Debugging "how does A reach B?" — answers in one call what would take 3-8 manual context/impact hops. Shows the exact chain with file:line positions plus a per-hop edge type and confidence.
+
+Traverses CALLS edges plus HAS_METHOD (class → member) edges, so a trace can descend from a class into its methods. Each hop's edge type is reported in edges[], so call hops and containment hops remain distinguishable.
+
+Returns: ordered hops with file:line, and an aligned edges[] of edge type + confidence. When no path exists, reports the furthest reachable node so you know where the chain breaks (and truncated: true if a traversal cap was hit first).`,
+    annotations: READ_ONLY_TOOL_ANNOTATIONS,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'Source symbol name' },
+        from_uid: { type: 'string', description: 'Source symbol UID (zero-ambiguity)' },
+        from_file: { type: 'string', description: 'Source file path hint for disambiguation' },
+        to: { type: 'string', description: 'Target symbol name' },
+        to_uid: { type: 'string', description: 'Target symbol UID (zero-ambiguity)' },
+        to_file: { type: 'string', description: 'Target file path hint for disambiguation' },
+        maxDepth: {
+          type: 'number',
+          description: 'Maximum path length in hops (default: 10)',
+          default: 10,
+          minimum: 1,
+          maximum: 30,
+        },
+        includeTests: {
+          type: 'boolean',
+          description: 'Include test-file symbols in traversal (default: false)',
+          default: false,
+        },
+        repo: {
+          type: 'string',
+          description: 'Repository name or path. Omit if only one repo is indexed.',
+        },
+      },
+      required: [],
+    },
+  },
 ];
 
 /**
@@ -702,6 +814,7 @@ const BRANCH_SCOPED_TOOLS = new Set([
   'context',
   'detect_changes',
   'explain',
+  'pdg_query',
   'check',
   'impact',
   'rename',
@@ -709,6 +822,7 @@ const BRANCH_SCOPED_TOOLS = new Set([
   'tool_map',
   'shape_check',
   'api_impact',
+  'trace',
 ]);
 
 for (const tool of GITNEXUS_TOOLS) {

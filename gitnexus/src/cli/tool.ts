@@ -76,7 +76,8 @@ export async function queryCommand(
 
   const backend = await getBackend();
   const result = await backend.callTool('query', {
-    query: queryText,
+    // #2175: canonical param is search_query; the backend still accepts legacy "query".
+    search_query: queryText,
     task_context: options?.context,
     goal: options?.goal,
     limit: options?.limit ? parseInt(options.limit) : undefined,
@@ -204,7 +205,8 @@ export async function cypherCommand(
 
   const backend = await getBackend();
   const result = await backend.callTool('cypher', {
-    query,
+    // #2175: canonical param is statement; the backend still accepts legacy "query".
+    statement: query,
     repo: options?.repo,
     branch: options?.branch,
   });
@@ -264,5 +266,66 @@ export async function checkCommand(options?: {
   } catch (error) {
     output({ error: error instanceof Error ? error.message : String(error) });
     process.exitCode = 1;
+  }
+}
+
+export async function traceCommand(
+  from?: string,
+  to?: string,
+  options?: {
+    fromUid?: string;
+    fromFile?: string;
+    toUid?: string;
+    toFile?: string;
+    depth?: string;
+    repo?: string;
+    branch?: string;
+    includeTests?: boolean;
+  },
+): Promise<void> {
+  if (options?.fromUid?.startsWith('--') || options?.toUid?.startsWith('--')) {
+    cliErrorKey('tool.usage.trace');
+    process.exit(1);
+  }
+  if ((!from?.trim() && !options?.fromUid) || (!to?.trim() && !options?.toUid)) {
+    cliErrorKey('tool.usage.trace');
+    process.exit(1);
+  }
+  // Reject a non-numeric / non-positive --depth up front rather than forwarding
+  // NaN (which the backend would silently treat as the default).
+  if (options?.depth !== undefined) {
+    const parsedDepth = Number(options.depth);
+    if (!Number.isInteger(parsedDepth) || parsedDepth < 1) {
+      cliErrorKey('tool.usage.trace');
+      process.exit(1);
+    }
+  }
+
+  try {
+    const backend = await getBackend();
+    const result = await backend.callTool('trace', {
+      from: from || undefined,
+      from_uid: options?.fromUid,
+      from_file: options?.fromFile,
+      to: to || undefined,
+      to_uid: options?.toUid,
+      to_file: options?.toFile,
+      maxDepth: options?.depth ? parseInt(options.depth, 10) : undefined,
+      includeTests: options?.includeTests ?? false,
+      repo: options?.repo,
+      branch: options?.branch,
+    });
+    output(result);
+  } catch (err: unknown) {
+    output({
+      status: 'error',
+      error:
+        (err instanceof Error ? err.message : String(err)) || 'Trace analysis failed unexpectedly',
+      from: { name: from },
+      to: { name: to },
+      suggestion:
+        'Try gitnexus context <symbol> to see connections, or check if an interface bridges them.',
+    });
+    process.exit(1);
   }
 }
