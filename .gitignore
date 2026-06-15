@@ -110,3 +110,8 @@ local_docs/
 .agents/
 .context/
 gitnexus/web/
+
+# Local launcher / secrets (never commit)
+start.bat
+_fix-author.js
+.env
